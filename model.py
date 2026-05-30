@@ -1,5 +1,5 @@
 # ============================================================
-# NFL DRAFT PREDICTION — IMPROVED ENSEMBLE (v2.2)
+# NFL DRAFT PREDICTION — FINAL ENSEMBLE (v3.0)
 # ============================================================
 
 import pandas as pd
@@ -11,8 +11,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import TargetEncoder, StandardScaler
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from sklearn.ensemble import ExtraTreesClassifier
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import LogisticRegression
 
 from lightgbm import LGBMClassifier, early_stopping
 from catboost import CatBoostClassifier
@@ -32,7 +31,7 @@ test_df = pd.read_csv(TEST_PATH)
 y = train_df['Drafted']
 test_ids = test_df['Id']
 
-# No eliminar 'Year' todavía, se usará como variable
+# Conservamos 'Year' como variable
 train_df.drop(columns=['Id', 'Drafted'], inplace=True)
 test_df.drop(columns=['Id'], inplace=True)
 
@@ -83,20 +82,21 @@ physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
                   'Broad_Jump', 'Agility_3cone', 'Shuttle']
 
 # ============================================================
-# 4. VALIDACIÓN CRUZADA (10 folds para mayor estabilidad)
+# 4. VALIDACIÓN CRUZADA (10 folds)
 # ============================================================
 skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 
-# Inicialización de arrays para OOF y test
-model_names = ['LGBM', 'CatBoost', 'XGBoost', 'ExtraTrees']
-models_oof = {name: np.zeros(len(train_df)) for name in model_names}
-test_preds = {name: np.zeros(len(test_df)) for name in model_names}
+# Solo usaremos los tres modelos fuertes
+oof_lgb = np.zeros(len(train_df))
+oof_cat = np.zeros(len(train_df))
+oof_xgb = np.zeros(len(train_df))
 
-oof_lgb, oof_cat, oof_xgb, oof_et = [models_oof[n] for n in model_names]
-test_lgb, test_cat, test_xgb, test_et = [test_preds[n] for n in model_names]
+test_lgb = np.zeros(len(test_df))
+test_cat = np.zeros(len(test_df))
+test_xgb = np.zeros(len(test_df))
 
 # ============================================================
-# 5. BUCLE DE ENTRENAMIENTO (con tuning interno por fold)
+# 5. BUCLE DE ENTRENAMIENTO (tuning más intensivo)
 # ============================================================
 for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     print(f'\n========== FOLD {fold+1} ==========')
@@ -167,24 +167,23 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         X_val[f'{col}_freq'].fillna(1, inplace=True)
         X_test_fold[f'{col}_freq'].fillna(1, inplace=True)
         
-        # Convertir la columna original a category (solo para modelos que la soporten)
         X_train[col] = X_train[col].astype('category')
         X_val[col] = X_val[col].astype('category')
         X_test_fold[col] = X_test_fold[col].astype('category')
 
     # ========================================================
-    # A. LIGHTGBM
+    # A. LIGHTGBM (búsqueda más exhaustiva: 20 iteraciones)
     # ========================================================
     lgb_param_dist = {
         'n_estimators': [2000],
         'learning_rate': [0.01, 0.02],
-        'num_leaves': [20, 31, 40],
-        'max_depth': [4, 6],
-        'min_child_samples': [20, 30],
-        'subsample': [0.7, 0.8],
-        'colsample_bytree': [0.7, 0.8],
-        'reg_alpha': [0.1, 1.0],
-        'reg_lambda': [0.1, 1.0]
+        'num_leaves': [20, 31, 40, 50],
+        'max_depth': [4, 6, 8],
+        'min_child_samples': [20, 30, 50],
+        'subsample': [0.7, 0.8, 0.9],
+        'colsample_bytree': [0.7, 0.8, 0.9],
+        'reg_alpha': [0.1, 1.0, 2.0],
+        'reg_lambda': [0.1, 1.0, 2.0]
     }
     lgb_base = LGBMClassifier(
         class_weight='balanced',
@@ -194,14 +193,14 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         force_col_wise=True
     )
     lgb_rs = RandomizedSearchCV(
-        lgb_base, lgb_param_dist, n_iter=10, scoring='roc_auc',
+        lgb_base, lgb_param_dist, n_iter=20, scoring='roc_auc',
         cv=3, random_state=42, n_jobs=-1
     )
     lgb_rs.fit(X_train, y_train, eval_set=[(X_val, y_val)])
     lgb_model = lgb_rs.best_estimator_
 
     # ========================================================
-    # B. CATBOOST
+    # B. CATBOOST (mantenemos parámetros afinados)
     # ========================================================
     cat_model = CatBoostClassifier(
         iterations=2000,
@@ -222,17 +221,17 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     )
 
     # ========================================================
-    # C. XGBOOST
+    # C. XGBOOST (búsqueda más exhaustiva: 20 iteraciones)
     # ========================================================
     scale_pos_weight = (len(y_train) - sum(y_train)) / sum(y_train)
     xgb_param_dist = {
         'n_estimators': [2000],
-        'learning_rate': [0.01, 0.02],
-        'max_depth': [4, 5],
-        'subsample': [0.7, 0.8],
-        'colsample_bytree': [0.7, 0.8],
-        'reg_alpha': [0.1, 1.0],
-        'reg_lambda': [1.0, 3.0],
+        'learning_rate': [0.01, 0.02, 0.03],
+        'max_depth': [4, 5, 6],
+        'subsample': [0.7, 0.8, 0.9],
+        'colsample_bytree': [0.7, 0.8, 0.9],
+        'reg_alpha': [0.1, 1.0, 2.0],
+        'reg_lambda': [1.0, 3.0, 5.0],
     }
     xgb_base = XGBClassifier(
         scale_pos_weight=scale_pos_weight,
@@ -242,30 +241,11 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         random_state=42
     )
     xgb_rs = RandomizedSearchCV(
-        xgb_base, xgb_param_dist, n_iter=10, scoring='roc_auc',
+        xgb_base, xgb_param_dist, n_iter=20, scoring='roc_auc',
         cv=3, random_state=42, n_jobs=-1
     )
     xgb_rs.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     xgb_model = xgb_rs.best_estimator_
-
-    # ========================================================
-    # D. EXTRA TREES (requiere eliminar columnas categóricas)
-    # ========================================================
-    # ExtraTrees no soporta 'category' ni strings; usamos solo las columnas numéricas
-    drop_cols = categorical_features  # ['School', 'Player_Type', 'Position_Type', 'Position']
-    X_train_et = X_train.drop(columns=drop_cols)
-    X_val_et   = X_val.drop(columns=drop_cols)
-    X_test_et  = X_test_fold.drop(columns=drop_cols)
-
-    et_model = ExtraTreesClassifier(
-        n_estimators=500,
-        max_depth=10,
-        min_samples_leaf=10,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1
-    )
-    et_model.fit(X_train_et, y_train)
 
     # ========================================================
     # PREDICCIONES
@@ -273,54 +253,55 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     pred_lgb = lgb_model.predict_proba(X_val)[:, 1]
     pred_cat = cat_model.predict_proba(X_val)[:, 1]
     pred_xgb = xgb_model.predict_proba(X_val)[:, 1]
-    pred_et  = et_model.predict_proba(X_val_et)[:, 1]   # <-- usar X_val_et
 
     oof_lgb[val_idx] = pred_lgb
     oof_cat[val_idx] = pred_cat
     oof_xgb[val_idx] = pred_xgb
-    oof_et[val_idx]  = pred_et
 
     test_lgb += lgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
     test_cat += cat_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
     test_xgb += xgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
-    test_et  += et_model.predict_proba(X_test_et)[:, 1] / skf.n_splits   # <-- usar X_test_et
 
     auc_lgb = roc_auc_score(y_val, pred_lgb)
     auc_cat = roc_auc_score(y_val, pred_cat)
     auc_xgb = roc_auc_score(y_val, pred_xgb)
-    auc_et  = roc_auc_score(y_val, pred_et)
-    print(f"AUC -> LGBM: {auc_lgb:.5f} | CAT: {auc_cat:.5f} | XGB: {auc_xgb:.5f} | ET: {auc_et:.5f}")
+    print(f"AUC -> LGBM: {auc_lgb:.5f} | CAT: {auc_cat:.5f} | XGB: {auc_xgb:.5f}")
 
 # ============================================================
-# 6. STACKING CON META‑MODELO (Ridge positivo)
+# 6. STACKING CON REGRESIÓN LOGÍSTICA (meta‑modelo nativo)
 # ============================================================
-oof_matrix = np.column_stack([oof_lgb, oof_cat, oof_xgb, oof_et])
-test_matrix = np.column_stack([test_lgb, test_cat, test_xgb, test_et])
+oof_matrix = np.column_stack([oof_lgb, oof_cat, oof_xgb])
+test_matrix = np.column_stack([test_lgb, test_cat, test_xgb])
 
-meta = Ridge(alpha=1.0, positive=True)
+# La regresión logística produce probabilidades y mantiene todo en [0,1]
+meta = LogisticRegression(penalty=None, class_weight='balanced', random_state=42)
 meta.fit(oof_matrix, y)
 
-weights = meta.coef_ / meta.coef_.sum()
-w_lgb, w_cat, w_xgb, w_et = weights
+# Pesos normalizados para interpretación (solo informativo)
+weights = np.abs(meta.coef_[0])
+weights /= weights.sum()
+w_lgb, w_cat, w_xgb = weights
 
-final_oof = meta.predict(oof_matrix)
+final_oof = meta.predict_proba(oof_matrix)[:, 1]
 final_score = roc_auc_score(y, final_oof)
 
 print('\n===============================')
-print(f'PESOS ÓPTIMOS (Ridge) -> LGBM: {w_lgb:.3f} | CAT: {w_cat:.3f} | XGB: {w_xgb:.3f} | ET: {w_et:.3f}')
+print(f'PESOS (LogReg) -> LGBM: {w_lgb:.3f} | CAT: {w_cat:.3f} | XGB: {w_xgb:.3f}')
 print(f'FINAL ROC AUC (CV): {final_score:.5f}')
 print('===============================')
 
 # ============================================================
-# 7. EXPORTAR SUBMISSION
+# 7. EXPORTAR SUBMISSION (con recorte explícito)
 # ============================================================
-final_test_preds = meta.predict(test_matrix)
+final_test_preds = meta.predict_proba(test_matrix)[:, 1]
+# Aseguramos valores en [0,1] por si hubiera pequeños errores numéricos
+final_test_preds = np.clip(final_test_preds, 0.0, 1.0)
 
 submission = pd.DataFrame({
     'Id': test_ids,
     'Drafted': final_test_preds
 })
 
-OUTPUT_PATH = 'data/submission_improved_ensemble.csv'
+OUTPUT_PATH = 'data/submission_final_ensemble.csv'
 submission.to_csv(OUTPUT_PATH, index=False)
 print(f'\nSubmission guardada en:\n{OUTPUT_PATH}')
