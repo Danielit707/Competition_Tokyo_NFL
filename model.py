@@ -1,17 +1,16 @@
 # ============================================================
-# NFL DRAFT PREDICTION — GPU‑DIVERSE ENSEMBLE (v5.0)
+# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.5 Pro)
 # ============================================================
 
 import pandas as pd
 import numpy as np
 import warnings
 
-from sklearn.model_selection import StratifiedKFold, GridSearchCV
+
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import TargetEncoder, StandardScaler
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer
-from sklearn.linear_model import LogisticRegression
+from scipy.optimize import minimize
 
 from lightgbm import LGBMClassifier, early_stopping
 from catboost import CatBoostClassifier
@@ -20,7 +19,7 @@ from xgboost import XGBClassifier
 warnings.filterwarnings('ignore')
 
 # ============================================================
-# 1. CARGA DE DATOS
+# 1. DATA LOADING
 # ============================================================
 TRAIN_PATH = 'data/train.csv'
 TEST_PATH  = 'data/test.csv'
@@ -35,17 +34,20 @@ train_df.drop(columns=['Id', 'Drafted'], inplace=True)
 test_df.drop(columns=['Id'], inplace=True)
 
 # ============================================================
-# 2. INGENIERÍA DE CARACTERÍSTICAS
+# 2. ADVANCED FEATURE ENGINEERING
 # ============================================================
 def add_features(df):
     df = df.copy()
-    
     physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
                       'Broad_Jump', 'Agility_3cone', 'Shuttle']
-    
+
+    #1. Performance at the Combine: Total number of tests missed
+    df['Total_Missing_Tests'] = df[physical_tests].isnull().sum(axis=1)
+
     for col in physical_tests:
         df[f'{col}_is_missing'] = df[col].isnull().astype(int)
 
+    #2. Vectorized physical formulas
     df['BMI'] = df['Weight'] / (df['Height']**2)
     df['SpeedScore'] = (df['Weight'] * 200) / (df['Sprint_40yd']**4)
     df['ExplosionScore'] = df['Vertical_Jump'] + df['Broad_Jump']
@@ -53,12 +55,17 @@ def add_features(df):
     df['AgilityScore'] = df['Agility_3cone'] + df['Shuttle']
     df['HeightWeight'] = df['Height'] * df['Weight']
 
+    #3. Cross-interactions between mass and motion
     df['Speed_x_Weight'] = df['Sprint_40yd'] * df['Weight']
     df['BMI_x_Strength'] = df['BMI'] * df['StrengthScore']
     df['Explosion_per_Weight'] = df['ExplosionScore'] / df['Weight']
 
+    # 4. Cruzado con el año histórico
     for col in physical_tests:
         df[f'{col}_x_Year'] = df[col] * df['Year']
+
+    #5. Compound categorical interaction: Captures the “Position Factory” effect
+    df['School_Position'] = df['School'].astype(str) + "_" + df['Position'].astype(str)
 
     return df
 
@@ -66,11 +73,11 @@ train_df = add_features(train_df)
 test_df = add_features(test_df)
 
 # ============================================================
-# 3. CONFIGURACIÓN
+# 3. ATRIBUTES CONFIGURATION
 # ============================================================
-categorical_features = ['School', 'Player_Type', 'Position_Type', 'Position']
+categorical_features = ['School', 'Player_Type', 'Position_Type', 'Position', 'School_Position']
 
-numeric_features = ['Age', 'Weight', 'Height', 'Year', 'BMI',
+numeric_features = ['Age', 'Weight', 'Height', 'Year', 'BMI', 'Total_Missing_Tests',
                     'SpeedScore', 'ExplosionScore', 'StrengthScore',
                     'AgilityScore', 'HeightWeight',
                     'Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
@@ -83,202 +90,198 @@ numeric_features += [f'{col}_x_Year' for col in ['Sprint_40yd', 'Vertical_Jump',
 physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
                   'Broad_Jump', 'Agility_3cone', 'Shuttle']
 
-# ============================================================
-# 4. MODELOS BASE DIVERSOS (5 configuraciones)
-# ============================================================
-# Definimos variantes que se entrenarán en cada fold
-base_models = {
-    'LGB_gbdt': LGBMClassifier(
-        boosting_type='gbdt', n_estimators=1500, learning_rate=0.015,
-        num_leaves=50, max_depth=6, min_child_samples=30,
-        subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.5, reg_lambda=1.5,
-        class_weight='balanced', random_state=42, verbose=-1,
-        force_col_wise=True
-    ),
-    'LGB_rf': LGBMClassifier(
-        boosting_type='rf', n_estimators=1500, learning_rate=0.015,
-        num_leaves=70, max_depth=8, min_child_samples=40,
-        subsample=0.8, colsample_bytree=0.7,
-        reg_alpha=0.1, reg_lambda=0.1,
-        class_weight='balanced', random_state=42, verbose=-1,
-        extra_trees=True, force_col_wise=True
-    ),
-    'CAT_depth4': CatBoostClassifier(
-        iterations=1500, learning_rate=0.02, depth=4, l2_leaf_reg=4,
-        auto_class_weights='Balanced', eval_metric='AUC',
-        early_stopping_rounds=100, random_seed=42, verbose=False,
-        task_type='GPU', devices='0'   # Usa tu RTX 2060
-    ),
-    'CAT_depth6': CatBoostClassifier(
-        iterations=1500, learning_rate=0.02, depth=6, l2_leaf_reg=3,
-        auto_class_weights='Balanced', eval_metric='AUC',
-        early_stopping_rounds=100, random_seed=42, verbose=False,
-        task_type='GPU', devices='0'
-    ),
-    'XGB_gbtree': XGBClassifier(
-        n_estimators=1500, learning_rate=0.015, max_depth=5,
-        subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=1.0, reg_lambda=3.0,
-        scale_pos_weight=1.0,              # se calculará por fold
-        tree_method='hist',            # GPU
-        enable_categorical=True,
-        early_stopping_rounds=100,
-        eval_metric='auc', random_state=42
-    ),
-    'XGB_dart': XGBClassifier(
-        n_estimators=1500, learning_rate=0.015, max_depth=5,
-        subsample=0.8, colsample_bytree=0.7,
-        reg_alpha=0.5, reg_lambda=2.0,
-        booster='dart', rate_drop=0.1,
-        tree_method='hist',
-        enable_categorical=True,
-        early_stopping_rounds=100,
-        eval_metric='auc', random_state=42
-    )
-}
-
-# Inicializamos arrays para las predicciones OOF y test de cada modelo
-oof_preds = {name: np.zeros(len(train_df)) for name in base_models}
-test_preds = {name: np.zeros(len(test_df)) for name in base_models}
-
-# ============================================================
-# 5. VALIDACIÓN CRUZADA 10‑FOLD (GPU permite más folds)
-# ============================================================
 skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 
-for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
-    print(f'\n========== FOLD {fold+1} ==========')
+oof_lgb = np.zeros(len(train_df))
+oof_cat = np.zeros(len(train_df))
+oof_xgb = np.zeros(len(train_df))
 
+test_lgb = np.zeros(len(test_df))
+test_cat = np.zeros(len(test_df))
+test_xgb = np.zeros(len(test_df))
+
+# ============================================================
+# 4. MAIN TRAINING LOOP
+# ============================================================
+for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     X_train = train_df.iloc[train_idx].copy()
     X_val = train_df.iloc[val_idx].copy()
     y_train = y.iloc[train_idx]
     y_val = y.iloc[val_idx]
     X_test_fold = test_df.copy()
 
-    # 1. Target Encoding
-    te = TargetEncoder(smooth="auto")
-    te_cols = ['School', 'Position', 'Player_Type']
+    # 1. Robust Target Encoding
+    te = TargetEncoder(smooth="auto", cv=5)
+    te_cols = ['School', 'Position', 'Player_Type', 'School_Position']
     te_feat_names = [f"{c}_te" for c in te_cols]
     X_train[te_feat_names] = te.fit_transform(X_train[te_cols], y_train)
     X_val[te_feat_names] = te.transform(X_val[te_cols])
     X_test_fold[te_feat_names] = te.transform(X_test_fold[te_cols])
 
-    # 2. Escalado e Imputación
+    # 2. Standard scaling while preserving NaNs
     scaler = StandardScaler()
     X_train[numeric_features] = scaler.fit_transform(X_train[numeric_features])
     X_val[numeric_features] = scaler.transform(X_val[numeric_features])
     X_test_fold[numeric_features] = scaler.transform(X_test_fold[numeric_features])
 
-    imputer = IterativeImputer(max_iter=10, random_state=42)
-    X_train[numeric_features] = imputer.fit_transform(X_train[numeric_features])
-    X_val[numeric_features] = imputer.transform(X_val[numeric_features])
-    X_test_fold[numeric_features] = imputer.transform(X_test_fold[numeric_features])
-
-    # 3. Features posicionales
+    # 3. Z-Score and Local Deviations by Position (Defensive vs. NaNs / Out-of-bounds)
     for col in physical_tests:
         means = X_train.groupby('Position_Type')[col].mean()
         stds = X_train.groupby('Position_Type')[col].std().replace(0, 1e-6)
         pos_med = X_train.groupby('Position_Type')[col].median()
         
-        X_train[f'{col}_z_pos'] = (X_train[col] - X_train['Position_Type'].map(means)) / X_train['Position_Type'].map(stds)
-        X_val[f'{col}_z_pos']   = (X_val[col]   - X_val['Position_Type'].map(means))   / X_val['Position_Type'].map(stds)
-        X_test_fold[f'{col}_z_pos'] = (X_test_fold[col] - X_test_fold['Position_Type'].map(means)) / X_test_fold['Position_Type'].map(stds)
+        # Global fallbacks for orphaned categories during validation
+        global_mean = X_train[col].mean()
+        global_std = X_train[col].std() if X_train[col].std() != 0 else 1e-6
+        global_med = X_train[col].median()
         
+        X_train[f'{col}_z_pos'] = (X_train[col] - X_train['Position_Type'].map(means)) / X_train['Position_Type'].map(stds)
+        X_val[f'{col}_z_pos']   = (X_val[col]   - X_val['Position_Type'].map(means).fillna(global_mean))   / X_val['Position_Type'].map(stds).fillna(global_std)
+        X_test_fold[f'{col}_z_pos'] = (X_test_fold[col] - X_test_fold['Position_Type'].map(means).fillna(global_mean)) / X_test_fold['Position_Type'].map(stds).fillna(global_std)
+
         X_train[f'{col}_diff_pos'] = X_train[col] - X_train['Position_Type'].map(pos_med)
-        X_val[f'{col}_diff_pos'] = X_val[col] - X_val['Position_Type'].map(pos_med)
-        X_test_fold[f'{col}_diff_pos'] = X_test_fold[col] - X_test_fold['Position_Type'].map(pos_med)
+        X_val[f'{col}_diff_pos'] = X_val[col] - X_val['Position_Type'].map(pos_med).fillna(global_med)
+        X_test_fold[f'{col}_diff_pos'] = X_test_fold[col] - X_test_fold['Position_Type'].map(pos_med).fillna(global_med)
 
-        for df_temp in [X_val, X_test_fold]:
-            df_temp[f'{col}_z_pos'].fillna(0, inplace=True)
-            df_temp[f'{col}_diff_pos'].fillna(0, inplace=True)
-
-    # 4. Frecuencias y categorías
+    # 4. Frequency coding and strict typing free of categorical NaNs
     for col in categorical_features:
         freq = X_train[col].value_counts()
         X_train[f'{col}_freq'] = X_train[col].map(freq)
-        X_val[f'{col}_freq'] = X_val[col].map(freq)
-        X_test_fold[f'{col}_freq'] = X_test_fold[col].map(freq)
-        X_val[f'{col}_freq'].fillna(1, inplace=True)
-        X_test_fold[f'{col}_freq'].fillna(1, inplace=True)
-        X_train[col] = X_train[col].astype('category')
-        X_val[col] = X_val[col].astype('category')
-        X_test_fold[col] = X_test_fold[col].astype('category')
+        X_val[f'{col}_freq'] = X_val[col].map(freq).fillna(1)
+        X_test_fold[f'{col}_freq'] = X_test_fold[col].map(freq).fillna(1)
+
+        X_train[col] = X_train[col].astype(str).replace(['nan', 'None', 'NaN'], 'missing')
+        X_val[col] = X_val[col].astype(str).replace(['nan', 'None', 'NaN'], 'missing')
+        X_test_fold[col] = X_test_fold[col].astype(str).replace(['nan', 'None', 'NaN'], 'missing')
+
+        cats = X_train[col].unique()
+        if "missing" not in cats:
+            cats = np.append(cats, "missing")
+
+        X_val[col] = X_val[col].where(X_val[col].isin(cats), "missing")
+        X_test_fold[col] = X_test_fold[col].where(X_test_fold[col].isin(cats), "missing")
+
+        X_train[col] = pd.Categorical(X_train[col], categories=cats)
+        X_val[col] = pd.Categorical(X_val[col], categories=cats)
+        X_test_fold[col] = pd.Categorical(X_test_fold[col], categories=cats)
+
+    # Enforce identical column order to prevent silent array errors
+    X_val = X_val[X_train.columns]
+    X_test_fold = X_test_fold[X_train.columns]
 
     # ========================================================
-    # ENTRENAMIENTO DE CADA VARIANTE
+    # A. LIGHTGBM 
     # ========================================================
-    # Calcular scale_pos_weight para XGB (balanceo interno)
-    sw = (len(y_train) - sum(y_train)) / sum(y_train)
+    lgb_model = LGBMClassifier(
+        boosting_type='gbdt',
+        n_estimators=3000,
+        learning_rate=0.01,
+        num_leaves=45,
+        max_depth=7,
+        min_child_samples=25,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        reg_alpha=1.5,
+        reg_lambda=2.5,
+        class_weight='balanced',
+        random_state=42,
+        verbose=-1,
+        n_jobs=-1
+    )
+    lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(150, verbose=False)])
 
-    for name, model in base_models.items():
-        # Clonar el modelo para no sobrescribir sus parámetros originales
-        fold_model = model.__class__(**model.get_params())
+    # ========================================================
+    # B. CATBOOST 
+    # ========================================================
+    cat_model = CatBoostClassifier(
+        iterations=3000,
+        learning_rate=0.015,
+        depth=6,
+        l2_leaf_reg=5,
+        auto_class_weights='Balanced',
+        eval_metric='AUC',
+        early_stopping_rounds=150,
+        task_type='GPU',
+        random_seed=42,
+        verbose=False
+    )
+    cat_model.fit(X_train, y_train, eval_set=(X_val, y_val), cat_features=categorical_features, use_best_model=True)
 
-        # Ajustes específicos por modelo
-        if name.startswith('LGB'):
-            fold_model.fit(X_train, y_train,
-                           eval_set=[(X_val, y_val)],
-                           callbacks=[early_stopping(100, verbose=False)])
-        elif name.startswith('CAT'):
-            fold_model.fit(X_train, y_train,
-                           eval_set=(X_val, y_val),
-                           cat_features=categorical_features,
-                           use_best_model=True)
-        elif name.startswith('XGB'):
-            fold_model.set_params(scale_pos_weight=sw)
-            fold_model.fit(X_train, y_train,
-                           eval_set=[(X_val, y_val)], verbose=False)
+    # ========================================================
+    # C. XGBOOST 
+    # ========================================================
+    scale_pos_weight = (len(y_train) - sum(y_train)) / sum(y_train)
+    xgb_model = XGBClassifier(
+        n_estimators=3000,
+        learning_rate=0.01,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        reg_alpha=2.0,
+        reg_lambda=6.0,
+        scale_pos_weight=scale_pos_weight,
+        tree_method='hist',
+        device='cuda',
+        enable_categorical=True,
+        early_stopping_rounds=150,
+        eval_metric='auc',
+        random_state=42
+    )
+    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-        # Predicciones
-        pred_val = fold_model.predict_proba(X_val)[:, 1]
-        pred_test = fold_model.predict_proba(X_test_fold)[:, 1]
+    # ========================================================
+    # ENSEMBLE PREDICTIONS
+    # ========================================================
+    pred_lgb = lgb_model.predict_proba(X_val)[:, 1]
+    pred_cat = cat_model.predict_proba(X_val)[:, 1]
+    pred_xgb = xgb_model.predict_proba(X_val)[:, 1]
 
-        oof_preds[name][val_idx] = pred_val
-        test_preds[name] += pred_test / skf.n_splits
+    oof_lgb[val_idx] = pred_lgb
+    oof_cat[val_idx] = pred_cat
+    oof_xgb[val_idx] = pred_xgb
 
-        print(f"   {name}: AUC={roc_auc_score(y_val, pred_val):.4f}")
+    test_lgb += lgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    test_cat += cat_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    test_xgb += xgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+
+    print(f"--> FOLD {fold+1}/10 | LGBM: {roc_auc_score(y_val, pred_lgb):.5f} | CAT: {roc_auc_score(y_val, pred_cat):.5f} | XGB: {roc_auc_score(y_val, pred_xgb):.5f}")
 
 # ============================================================
-# 6. META‑MODELO (LogisticRegression con búsqueda de C)
+# 5. OPTIMIZATION METAMODEL ON THE AUC HYPERPLANE (POWELL + SOFTMAX)
 # ============================================================
-oof_matrix = np.column_stack([oof_preds[n] for n in base_models])
-test_matrix = np.column_stack([test_preds[n] for n in base_models])
+def auc_loss(weights_raw):
+    # Convert arbitrary real numbers into a probability vector (sum 1, range [0,1])
+    exp_w = np.exp(weights_raw - np.max(weights_raw)) # Estabilidad numérica contra desbordamientos
+    w = exp_w / np.sum(exp_w)
+    
+    blend = w[0] * oof_lgb + w[1] * oof_cat + w[2] * oof_xgb
+    return -roc_auc_score(y, blend)
 
-# Búsqueda del mejor C para evitar sobreajuste en el stacking
-param_grid = {'C': [0.01, 0.1, 1.0, 10.0, 100.0]}
-meta_cv = GridSearchCV(
-    LogisticRegression(penalty='l2', solver='liblinear', random_state=42),
-    param_grid, cv=5, scoring='roc_auc'
-)
-meta_cv.fit(oof_matrix, y)
-meta = meta_cv.best_estimator_
+# Powell does not require direct derivatives; it will skip the flat plateaus in the AUC range calculation
+opt_res = minimize(auc_loss, x0=[0.0, 0.0, 0.0], method='Powell')
 
-final_oof = meta.predict_proba(oof_matrix)[:, 1]
+# Reconstruct the normalized weights from the returned optimal vector
+exp_w_opt = np.exp(opt_res.x - np.max(opt_res.x))
+w_lgb, w_cat, w_xgb = exp_w_opt / np.sum(exp_w_opt)
+
+final_oof = w_lgb * oof_lgb + w_cat * oof_cat + w_xgb * oof_xgb
 final_score = roc_auc_score(y, final_oof)
 
-# Pesos interpretables (coeficientes absolutos normalizados)
-weights = np.abs(meta.coef_[0])
-weights /= weights.sum()
-
-print('\n===============================')
-print('PESOS FINALES:')
-for name, w in zip(base_models.keys(), weights):
-    print(f'   {name}: {w:.3f}')
-print(f'FINAL ROC AUC (CV): {final_score:.5f}')
-print('===============================')
+print('\n==================================================')
+print(f'PESOS ÓPTIMOS ENCONTRADOS -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f}')
+print(f'NUEVO ROC AUC GLOBAL (10-Fold CV Ensamble): {final_score:.5f}')
+print('==================================================')
 
 # ============================================================
-# 7. EXPORTAR SUBMISSION
+# 6. EXPORT SUBMISSION
 # ============================================================
-final_test_preds = meta.predict_proba(test_matrix)[:, 1]
-final_test_preds = np.clip(final_test_preds, 0.0, 1.0)
+final_test_preds = np.clip(w_lgb * test_lgb + w_cat * test_cat + w_xgb * test_xgb, 0.0, 1.0)
 
 submission = pd.DataFrame({
     'Id': test_ids,
     'Drafted': final_test_preds
 })
 
-OUTPUT_PATH = 'data/submission_gpu_diverse_ensemble.csv'
+OUTPUT_PATH = '/content/drive/MyDrive/tokyoGCI_Competition/submission_advanced_ensemble.csv'
 submission.to_csv(OUTPUT_PATH, index=False)
-print(f'\nSubmission guardada en:\n{OUTPUT_PATH}')
+print(f'\nCompleted. File saved in:\n{OUTPUT_PATH}')
