@@ -282,6 +282,6 @@ submission = pd.DataFrame({
     'Drafted': final_test_preds
 })
 
-OUTPUT_PATH = '/content/drive/MyDrive/tokyoGCI_Competition/submission_advanced_ensemble.csv'
+OUTPUT_PATH = 'data/submission_advanced_ensemble.csv'
 submission.to_csv(OUTPUT_PATH, index=False)
 print(f'\nCompleted. File saved in:\n{OUTPUT_PATH}')
