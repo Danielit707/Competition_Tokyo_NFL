@@ -1,16 +1,16 @@
 # ============================================================
-# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.5 Pro)
+# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.6 Pro)
 # ============================================================
 
 import pandas as pd
 import numpy as np
 import warnings
 
-
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import TargetEncoder, StandardScaler
 from scipy.optimize import minimize
+from scipy.stats import rankdata
 
 from lightgbm import LGBMClassifier, early_stopping
 from catboost import CatBoostClassifier
@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # 1. DATA LOADING
 # ============================================================
+
 TRAIN_PATH = 'data/train.csv'
 TEST_PATH  = 'data/test.csv'
 
@@ -41,13 +42,13 @@ def add_features(df):
     physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
                       'Broad_Jump', 'Agility_3cone', 'Shuttle']
 
-    #1. Performance at the Combine: Total number of tests missed
+    # 1. Performance at the Combine: Total number of tests missed
     df['Total_Missing_Tests'] = df[physical_tests].isnull().sum(axis=1)
 
     for col in physical_tests:
         df[f'{col}_is_missing'] = df[col].isnull().astype(int)
 
-    #2. Vectorized physical formulas
+    # 2. Vectorized physical formulas
     df['BMI'] = df['Weight'] / (df['Height']**2)
     df['SpeedScore'] = (df['Weight'] * 200) / (df['Sprint_40yd']**4)
     df['ExplosionScore'] = df['Vertical_Jump'] + df['Broad_Jump']
@@ -55,16 +56,16 @@ def add_features(df):
     df['AgilityScore'] = df['Agility_3cone'] + df['Shuttle']
     df['HeightWeight'] = df['Height'] * df['Weight']
 
-    #3. Cross-interactions between mass and motion
+    # 3. Cross-interactions between mass and motion
     df['Speed_x_Weight'] = df['Sprint_40yd'] * df['Weight']
     df['BMI_x_Strength'] = df['BMI'] * df['StrengthScore']
     df['Explosion_per_Weight'] = df['ExplosionScore'] / df['Weight']
 
-    # 4. Cruzado con el año histórico
+    # 4. Cross-interactions with historical year
     for col in physical_tests:
         df[f'{col}_x_Year'] = df[col] * df['Year']
 
-    #5. Compound categorical interaction: Captures the “Position Factory” effect
+    # 5. Compound categorical interaction: Captures the "Position Factory" effect
     df['School_Position'] = df['School'].astype(str) + "_" + df['Position'].astype(str)
 
     return df
@@ -73,7 +74,7 @@ train_df = add_features(train_df)
 test_df = add_features(test_df)
 
 # ============================================================
-# 3. ATRIBUTES CONFIGURATION
+# 3. ATTRIBUTES CONFIGURATION
 # ============================================================
 categorical_features = ['School', 'Player_Type', 'Position_Type', 'Position', 'School_Position']
 
@@ -130,7 +131,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         stds = X_train.groupby('Position_Type')[col].std().replace(0, 1e-6)
         pos_med = X_train.groupby('Position_Type')[col].median()
         
-        # Global fallbacks for orphaned categories during validation
         global_mean = X_train[col].mean()
         global_std = X_train[col].std() if X_train[col].std() != 0 else 1e-6
         global_med = X_train[col].median()
@@ -247,35 +247,40 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     print(f"--> FOLD {fold+1}/10 | LGBM: {roc_auc_score(y_val, pred_lgb):.5f} | CAT: {roc_auc_score(y_val, pred_cat):.5f} | XGB: {roc_auc_score(y_val, pred_xgb):.5f}")
 
 # ============================================================
-# 5. OPTIMIZATION METAMODEL ON THE AUC HYPERPLANE (POWELL + SOFTMAX)
+# 5. RANK-BASED HYPERPLANE OPTIMIZATION (POWELL + SOFTMAX)
 # ============================================================
+oof_lgb_rank = rankdata(oof_lgb) / len(oof_lgb)
+oof_cat_rank = rankdata(oof_cat) / len(oof_cat)
+oof_xgb_rank = rankdata(oof_xgb) / len(oof_xgb)
+
+test_lgb_rank = rankdata(test_lgb) / len(test_lgb)
+test_cat_rank = rankdata(test_cat) / len(test_cat)
+test_xgb_rank = rankdata(test_xgb) / len(test_xgb)
+
 def auc_loss(weights_raw):
-    # Convert arbitrary real numbers into a probability vector (sum 1, range [0,1])
-    exp_w = np.exp(weights_raw - np.max(weights_raw)) # Estabilidad numérica contra desbordamientos
+    exp_w = np.exp(weights_raw - np.max(weights_raw)) 
     w = exp_w / np.sum(exp_w)
     
-    blend = w[0] * oof_lgb + w[1] * oof_cat + w[2] * oof_xgb
+    blend = w[0] * oof_lgb_rank + w[1] * oof_cat_rank + w[2] * oof_xgb_rank
     return -roc_auc_score(y, blend)
 
-# Powell does not require direct derivatives; it will skip the flat plateaus in the AUC range calculation
 opt_res = minimize(auc_loss, x0=[0.0, 0.0, 0.0], method='Powell')
 
-# Reconstruct the normalized weights from the returned optimal vector
 exp_w_opt = np.exp(opt_res.x - np.max(opt_res.x))
 w_lgb, w_cat, w_xgb = exp_w_opt / np.sum(exp_w_opt)
 
-final_oof = w_lgb * oof_lgb + w_cat * oof_cat + w_xgb * oof_xgb
+final_oof = w_lgb * oof_lgb_rank + w_cat * oof_cat_rank + w_xgb * oof_xgb_rank
 final_score = roc_auc_score(y, final_oof)
 
 print('\n==================================================')
-print(f'PESOS ÓPTIMOS ENCONTRADOS -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f}')
-print(f'NUEVO ROC AUC GLOBAL (10-Fold CV Ensamble): {final_score:.5f}')
+print(f'OPTIMAL RANK WEIGHTS FOUND -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f}')
+print(f'NEW GLOBAL ROC AUC (10-Fold CV Rank Ensemble): {final_score:.5f}')
 print('==================================================')
 
 # ============================================================
 # 6. EXPORT SUBMISSION
 # ============================================================
-final_test_preds = np.clip(w_lgb * test_lgb + w_cat * test_cat + w_xgb * test_xgb, 0.0, 1.0)
+final_test_preds = np.clip(w_lgb * test_lgb_rank + w_cat * test_cat_rank + w_xgb * test_xgb_rank, 0.0, 1.0)
 
 submission = pd.DataFrame({
     'Id': test_ids,
@@ -284,4 +289,4 @@ submission = pd.DataFrame({
 
 OUTPUT_PATH = 'data/submission_advanced_ensemble.csv'
 submission.to_csv(OUTPUT_PATH, index=False)
-print(f'\nCompleted. File saved in:\n{OUTPUT_PATH}')
+print(f'\nSuccess! High-performance submission saved to:\n{OUTPUT_PATH}')
