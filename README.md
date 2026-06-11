@@ -42,7 +42,7 @@ The main dependencies are:
 
 **🏃 How to Run**
 
-Ensure the dataset (train.csv and test.csv) is available in the relative path data/ or mounted via Google Drive at /content/drive/MyDrive/tokyoGCI_Competition/.
+Ensure the dataset (train.csv and test.csv) is available in the relative path data/
 
 Run the main model script:
 ```
