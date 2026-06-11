@@ -1,5 +1,5 @@
 # ============================================================
-# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.6 Pro)
+# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.8 Pro)
 # ============================================================
 
 import pandas as pd
@@ -96,10 +96,12 @@ skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 oof_lgb = np.zeros(len(train_df))
 oof_cat = np.zeros(len(train_df))
 oof_xgb = np.zeros(len(train_df))
+oof_xgb_deep = np.zeros(len(train_df))
 
 test_lgb = np.zeros(len(test_df))
 test_cat = np.zeros(len(test_df))
 test_xgb = np.zeros(len(test_df))
+test_xgb_deep = np.zeros(len(test_df))
 
 # ============================================================
 # 4. MAIN TRAINING LOOP
@@ -130,11 +132,11 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         means = X_train.groupby('Position_Type')[col].mean()
         stds = X_train.groupby('Position_Type')[col].std().replace(0, 1e-6)
         pos_med = X_train.groupby('Position_Type')[col].median()
-        
+
         global_mean = X_train[col].mean()
         global_std = X_train[col].std() if X_train[col].std() != 0 else 1e-6
         global_med = X_train[col].median()
-        
+
         X_train[f'{col}_z_pos'] = (X_train[col] - X_train['Position_Type'].map(means)) / X_train['Position_Type'].map(stds)
         X_val[f'{col}_z_pos']   = (X_val[col]   - X_val['Position_Type'].map(means).fillna(global_mean))   / X_val['Position_Type'].map(stds).fillna(global_std)
         X_test_fold[f'{col}_z_pos'] = (X_test_fold[col] - X_test_fold['Position_Type'].map(means).fillna(global_mean)) / X_test_fold['Position_Type'].map(stds).fillna(global_std)
@@ -170,7 +172,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     X_test_fold = X_test_fold[X_train.columns]
 
     # ========================================================
-    # A. LIGHTGBM 
+    # A. LIGHTGBM
     # ========================================================
     lgb_model = LGBMClassifier(
         boosting_type='gbdt',
@@ -191,7 +193,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(150, verbose=False)])
 
     # ========================================================
-    # B. CATBOOST 
+    # B. CATBOOST
     # ========================================================
     cat_model = CatBoostClassifier(
         iterations=3000,
@@ -208,7 +210,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     cat_model.fit(X_train, y_train, eval_set=(X_val, y_val), cat_features=categorical_features, use_best_model=True)
 
     # ========================================================
-    # C. XGBOOST 
+    # C. XGBOOST
     # ========================================================
     scale_pos_weight = (len(y_train) - sum(y_train)) / sum(y_train)
     xgb_model = XGBClassifier(
@@ -230,21 +232,45 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
     # ========================================================
-    # ENSEMBLE PREDICTIONS
+    # D. XGBOOST DEEP
     # ========================================================
-    pred_lgb = lgb_model.predict_proba(X_val)[:, 1]
-    pred_cat = cat_model.predict_proba(X_val)[:, 1]
-    pred_xgb = xgb_model.predict_proba(X_val)[:, 1]
+    xgb_deep_model = XGBClassifier(
+        n_estimators=3000,
+        learning_rate=0.008,
+        max_depth=8,
+        subsample=0.75,
+        colsample_bytree=0.5,
+        reg_alpha=1.5,
+        reg_lambda=12.0,
+        scale_pos_weight=scale_pos_weight,
+        tree_method='hist',
+        device='cuda',
+        enable_categorical=True,
+        early_stopping_rounds=150,
+        eval_metric='auc',
+        random_state=2026
+    )
+    xgb_deep_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-    oof_lgb[val_idx] = pred_lgb
-    oof_cat[val_idx] = pred_cat
-    oof_xgb[val_idx] = pred_xgb
+    # ========================================================
+    # ENSEMBLE PREDICTIONS (Within-Fold Rank Scaling)
+    # ========================================================
+    raw_pred_lgb = lgb_model.predict_proba(X_val)[:, 1]
+    raw_pred_cat = cat_model.predict_proba(X_val)[:, 1]
+    raw_pred_xgb = xgb_model.predict_proba(X_val)[:, 1]
+    raw_pred_xgb_deep = xgb_deep_model.predict_proba(X_val)[:, 1]
 
-    test_lgb += lgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
-    test_cat += cat_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
-    test_xgb += xgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    oof_lgb[val_idx] = rankdata(raw_pred_lgb) / len(raw_pred_lgb)
+    oof_cat[val_idx] = rankdata(raw_pred_cat) / len(raw_pred_cat)
+    oof_xgb[val_idx] = rankdata(raw_pred_xgb) / len(raw_pred_xgb)
+    oof_xgb_deep[val_idx] = rankdata(raw_pred_xgb_deep) / len(raw_pred_xgb_deep)
 
-    print(f"--> FOLD {fold+1}/10 | LGBM: {roc_auc_score(y_val, pred_lgb):.5f} | CAT: {roc_auc_score(y_val, pred_cat):.5f} | XGB: {roc_auc_score(y_val, pred_xgb):.5f}")
+    test_lgb += (rankdata(lgb_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
+    test_cat += (rankdata(cat_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
+    test_xgb += (rankdata(xgb_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
+    test_xgb_deep += (rankdata(xgb_deep_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
+
+    print(f"--> FOLD {fold+1}/10 | LGBM: {roc_auc_score(y_val, oof_lgb[val_idx]):.5f} | CAT: {roc_auc_score(y_val, oof_cat[val_idx]):.5f} | XGB: {roc_auc_score(y_val, oof_xgb[val_idx]):.5f} | XGB_DEEP: {roc_auc_score(y_val, oof_xgb_deep[val_idx]):.5f}")
 
 # ============================================================
 # 5. RANK-BASED HYPERPLANE OPTIMIZATION (POWELL + SOFTMAX)
@@ -252,35 +278,37 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
 oof_lgb_rank = rankdata(oof_lgb) / len(oof_lgb)
 oof_cat_rank = rankdata(oof_cat) / len(oof_cat)
 oof_xgb_rank = rankdata(oof_xgb) / len(oof_xgb)
+oof_xgb_deep_rank = rankdata(oof_xgb_deep) / len(oof_xgb_deep)
 
 test_lgb_rank = rankdata(test_lgb) / len(test_lgb)
 test_cat_rank = rankdata(test_cat) / len(test_cat)
 test_xgb_rank = rankdata(test_xgb) / len(test_xgb)
+test_xgb_deep_rank = rankdata(test_xgb_deep) / len(test_xgb_deep)
 
 def auc_loss(weights_raw):
-    exp_w = np.exp(weights_raw - np.max(weights_raw)) 
+    exp_w = np.exp(weights_raw - np.max(weights_raw))
     w = exp_w / np.sum(exp_w)
-    
-    blend = w[0] * oof_lgb_rank + w[1] * oof_cat_rank + w[2] * oof_xgb_rank
+
+    blend = w[0] * oof_lgb_rank + w[1] * oof_cat_rank + w[2] * oof_xgb_rank + w[3] * oof_xgb_deep_rank
     return -roc_auc_score(y, blend)
 
-opt_res = minimize(auc_loss, x0=[0.0, 0.0, 0.0], method='Powell')
+opt_res = minimize(auc_loss, x0=[0.0, 0.0, 0.0, 0.0], method='Powell')
 
 exp_w_opt = np.exp(opt_res.x - np.max(opt_res.x))
-w_lgb, w_cat, w_xgb = exp_w_opt / np.sum(exp_w_opt)
+w_lgb, w_cat, w_xgb, w_xgb_deep = exp_w_opt / np.sum(exp_w_opt)
 
-final_oof = w_lgb * oof_lgb_rank + w_cat * oof_cat_rank + w_xgb * oof_xgb_rank
+final_oof = w_lgb * oof_lgb_rank + w_cat * oof_cat_rank + w_xgb * oof_xgb_rank + w_xgb_deep * oof_xgb_deep_rank
 final_score = roc_auc_score(y, final_oof)
 
 print('\n==================================================')
-print(f'OPTIMAL RANK WEIGHTS FOUND -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f}')
+print(f'OPTIMAL RANK WEIGHTS FOUND -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f} | XGB_DEEP: {w_xgb_deep:.4f}')
 print(f'NEW GLOBAL ROC AUC (10-Fold CV Rank Ensemble): {final_score:.5f}')
 print('==================================================')
 
 # ============================================================
 # 6. EXPORT SUBMISSION
 # ============================================================
-final_test_preds = np.clip(w_lgb * test_lgb_rank + w_cat * test_cat_rank + w_xgb * test_xgb_rank, 0.0, 1.0)
+final_test_preds = np.clip(w_lgb * test_lgb_rank + w_cat * test_cat_rank + w_xgb * test_xgb_rank + w_xgb_deep * test_xgb_deep_rank, 0.0, 1.0)
 
 submission = pd.DataFrame({
     'Id': test_ids,
