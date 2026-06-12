@@ -1,5 +1,5 @@
 # ============================================================
-# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE (v5.8 Pro)
+# NFL DRAFT PREDICTION — HIGH-ACCURACY GPU ENSEMBLE 
 # ============================================================
 
 import pandas as pd
@@ -34,44 +34,66 @@ test_ids = test_df['Id']
 train_df.drop(columns=['Id', 'Drafted'], inplace=True)
 test_df.drop(columns=['Id'], inplace=True)
 
+n_train = len(train_df)
+
 # ============================================================
-# 2. ADVANCED FEATURE ENGINEERING
+# 2. ADVANCED FEATURE ENGINEERING WITH UNIFIED PROFILING
 # ============================================================
+df_all = pd.concat([train_df, test_df], axis=0).reset_index(drop=True)
+
 def add_features(df):
     df = df.copy()
     physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
                       'Broad_Jump', 'Agility_3cone', 'Shuttle']
 
-    # 1. Performance at the Combine: Total number of tests missed
     df['Total_Missing_Tests'] = df[physical_tests].isnull().sum(axis=1)
 
     for col in physical_tests:
         df[f'{col}_is_missing'] = df[col].isnull().astype(int)
 
-    # 2. Vectorized physical formulas
     df['BMI'] = df['Weight'] / (df['Height']**2)
     df['SpeedScore'] = (df['Weight'] * 200) / (df['Sprint_40yd']**4)
     df['ExplosionScore'] = df['Vertical_Jump'] + df['Broad_Jump']
     df['StrengthScore'] = df['Bench_Press_Reps'] / df['Weight']
     df['AgilityScore'] = df['Agility_3cone'] + df['Shuttle']
     df['HeightWeight'] = df['Height'] * df['Weight']
+    
+    df['Power_Index'] = df['Weight'] * df['Vertical_Jump']
+    df['Size_Adjusted_Agility'] = df['AgilityScore'] * df['BMI']
+    df['Catch_Radius_Proxy'] = df['Height'] + df['Vertical_Jump']
 
-    # 3. Cross-interactions between mass and motion
     df['Speed_x_Weight'] = df['Sprint_40yd'] * df['Weight']
     df['BMI_x_Strength'] = df['BMI'] * df['StrengthScore']
     df['Explosion_per_Weight'] = df['ExplosionScore'] / df['Weight']
 
-    # 4. Cross-interactions with historical year
     for col in physical_tests:
         df[f'{col}_x_Year'] = df[col] * df['Year']
 
-    # 5. Compound categorical interaction: Captures the "Position Factory" effect
     df['School_Position'] = df['School'].astype(str) + "_" + df['Position'].astype(str)
 
     return df
 
-train_df = add_features(train_df)
-test_df = add_features(test_df)
+df_all = add_features(df_all)
+
+# Compute both Year-Cohort and Position-Cohort metrics globally to eliminate test drift
+physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps', 'Broad_Jump', 'Agility_3cone', 'Shuttle']
+for col in physical_tests:
+    # Year Cohorts
+    year_means = df_all.groupby('Year')[col].transform('mean')
+    year_stds = df_all.groupby('Year')[col].transform('std').fillna(1e-6).replace(0, 1e-6)
+    df_all[f'{col}_year_zscore'] = (df_all[col] - year_means) / year_stds
+    
+    # Position Cohorts (Unified calculation)
+    pos_means = df_all.groupby('Position_Type')[col].transform('mean')
+    pos_stds = df_all.groupby('Position_Type')[col].transform('std').fillna(1e-6).replace(0, 1e-6)
+    pos_meds = df_all.groupby('Position_Type')[col].transform('median')
+    
+    df_all[f'{col}_z_pos'] = (df_all[col] - pos_means) / pos_stds
+    df_all[f'{col}_diff_pos'] = df_all[col] - pos_meds
+
+# Resplit frames cleanly
+train_df = df_all.iloc[:n_train].copy().reset_index(drop=True)
+test_df = df_all.iloc[n_train:].copy().reset_index(drop=True)
 
 # ============================================================
 # 3. ATTRIBUTES CONFIGURATION
@@ -79,29 +101,29 @@ test_df = add_features(test_df)
 categorical_features = ['School', 'Player_Type', 'Position_Type', 'Position', 'School_Position']
 
 numeric_features = ['Age', 'Weight', 'Height', 'Year', 'BMI', 'Total_Missing_Tests',
-                    'SpeedScore', 'ExplosionScore', 'StrengthScore',
-                    'AgilityScore', 'HeightWeight',
-                    'Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
-                    'Broad_Jump', 'Agility_3cone', 'Shuttle',
-                    'Speed_x_Weight', 'BMI_x_Strength', 'Explosion_per_Weight']
+                    'SpeedScore', 'ExplosionScore', 'StrengthScore', 'AgilityScore', 
+                    'HeightWeight', 'Power_Index', 'Size_Adjusted_Agility', 'Catch_Radius_Proxy',
+                    'Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps', 'Broad_Jump', 
+                    'Agility_3cone', 'Shuttle', 'Speed_x_Weight', 'BMI_x_Strength', 
+                    'Explosion_per_Weight']
 
-numeric_features += [f'{col}_x_Year' for col in ['Sprint_40yd', 'Vertical_Jump',
-                     'Bench_Press_Reps', 'Broad_Jump', 'Agility_3cone', 'Shuttle']]
-
-physical_tests = ['Sprint_40yd', 'Vertical_Jump', 'Bench_Press_Reps',
-                  'Broad_Jump', 'Agility_3cone', 'Shuttle']
+numeric_features += [f'{col}_x_Year' for col in physical_tests]
+numeric_features += [f'{col}_year_zscore' for col in physical_tests]
+numeric_features += [f'{col}_z_pos' for col in physical_tests]
+numeric_features += [f'{col}_diff_pos' for col in physical_tests]
 
 skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 
+# OOF Arrays store raw structural probabilities to protect baseline calibration
 oof_lgb = np.zeros(len(train_df))
 oof_cat = np.zeros(len(train_df))
 oof_xgb = np.zeros(len(train_df))
 oof_xgb_deep = np.zeros(len(train_df))
 
-test_lgb = np.zeros(len(test_df))
-test_cat = np.zeros(len(test_df))
-test_xgb = np.zeros(len(test_df))
-test_xgb_deep = np.zeros(len(test_df))
+test_lgb_raw = np.zeros(len(test_df))
+test_cat_raw = np.zeros(len(test_df))
+test_xgb_raw = np.zeros(len(test_df))
+test_xgb_deep_raw = np.zeros(len(test_df))
 
 # ============================================================
 # 4. MAIN TRAINING LOOP
@@ -113,7 +135,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     y_val = y.iloc[val_idx]
     X_test_fold = test_df.copy()
 
-    # 1. Robust Target Encoding
+    # 1. Target Encoding
     te = TargetEncoder(smooth="auto", cv=5)
     te_cols = ['School', 'Position', 'Player_Type', 'School_Position']
     te_feat_names = [f"{c}_te" for c in te_cols]
@@ -121,31 +143,13 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     X_val[te_feat_names] = te.transform(X_val[te_cols])
     X_test_fold[te_feat_names] = te.transform(X_test_fold[te_cols])
 
-    # 2. Standard scaling while preserving NaNs
+    # 2. Standard Scaling (Preserving Structure)
     scaler = StandardScaler()
     X_train[numeric_features] = scaler.fit_transform(X_train[numeric_features])
     X_val[numeric_features] = scaler.transform(X_val[numeric_features])
     X_test_fold[numeric_features] = scaler.transform(X_test_fold[numeric_features])
 
-    # 3. Z-Score and Local Deviations by Position (Defensive vs. NaNs / Out-of-bounds)
-    for col in physical_tests:
-        means = X_train.groupby('Position_Type')[col].mean()
-        stds = X_train.groupby('Position_Type')[col].std().replace(0, 1e-6)
-        pos_med = X_train.groupby('Position_Type')[col].median()
-
-        global_mean = X_train[col].mean()
-        global_std = X_train[col].std() if X_train[col].std() != 0 else 1e-6
-        global_med = X_train[col].median()
-
-        X_train[f'{col}_z_pos'] = (X_train[col] - X_train['Position_Type'].map(means)) / X_train['Position_Type'].map(stds)
-        X_val[f'{col}_z_pos']   = (X_val[col]   - X_val['Position_Type'].map(means).fillna(global_mean))   / X_val['Position_Type'].map(stds).fillna(global_std)
-        X_test_fold[f'{col}_z_pos'] = (X_test_fold[col] - X_test_fold['Position_Type'].map(means).fillna(global_mean)) / X_test_fold['Position_Type'].map(stds).fillna(global_std)
-
-        X_train[f'{col}_diff_pos'] = X_train[col] - X_train['Position_Type'].map(pos_med)
-        X_val[f'{col}_diff_pos'] = X_val[col] - X_val['Position_Type'].map(pos_med).fillna(global_med)
-        X_test_fold[f'{col}_diff_pos'] = X_test_fold[col] - X_test_fold['Position_Type'].map(pos_med).fillna(global_med)
-
-    # 4. Frequency coding and strict typing free of categorical NaNs
+    # 3. Frequency Coding & Categorical Cleaning
     for col in categorical_features:
         freq = X_train[col].value_counts()
         X_train[f'{col}_freq'] = X_train[col].map(freq)
@@ -167,18 +171,17 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         X_val[col] = pd.Categorical(X_val[col], categories=cats)
         X_test_fold[col] = pd.Categorical(X_test_fold[col], categories=cats)
 
-    # Enforce identical column order to prevent silent array errors
     X_val = X_val[X_train.columns]
     X_test_fold = X_test_fold[X_train.columns]
 
     # ========================================================
-    # A. LIGHTGBM
+    # A. LIGHTGBM (Balanced Complexity Variant)
     # ========================================================
     lgb_model = LGBMClassifier(
         boosting_type='gbdt',
         n_estimators=3000,
         learning_rate=0.01,
-        num_leaves=45,
+        num_leaves=42,
         max_depth=7,
         min_child_samples=25,
         subsample=0.8,
@@ -186,6 +189,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
         reg_alpha=1.5,
         reg_lambda=2.5,
         class_weight='balanced',
+        metric='auc',
         random_state=42,
         verbose=-1,
         n_jobs=-1
@@ -193,7 +197,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping(150, verbose=False)])
 
     # ========================================================
-    # B. CATBOOST
+    # B. CATBOOST (High-Stability GPU)
     # ========================================================
     cat_model = CatBoostClassifier(
         iterations=3000,
@@ -252,38 +256,31 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, y)):
     )
     xgb_deep_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-    # ========================================================
-    # ENSEMBLE PREDICTIONS (Within-Fold Rank Scaling)
-    # ========================================================
-    raw_pred_lgb = lgb_model.predict_proba(X_val)[:, 1]
-    raw_pred_cat = cat_model.predict_proba(X_val)[:, 1]
-    raw_pred_xgb = xgb_model.predict_proba(X_val)[:, 1]
-    raw_pred_xgb_deep = xgb_deep_model.predict_proba(X_val)[:, 1]
+    # Store raw probabilities to prevent intra-fold distribution destruction
+    oof_lgb[val_idx] = lgb_model.predict_proba(X_val)[:, 1]
+    oof_cat[val_idx] = cat_model.predict_proba(X_val)[:, 1]
+    oof_xgb[val_idx] = xgb_model.predict_proba(X_val)[:, 1]
+    oof_xgb_deep[val_idx] = xgb_deep_model.predict_proba(X_val)[:, 1]
 
-    oof_lgb[val_idx] = rankdata(raw_pred_lgb) / len(raw_pred_lgb)
-    oof_cat[val_idx] = rankdata(raw_pred_cat) / len(raw_pred_cat)
-    oof_xgb[val_idx] = rankdata(raw_pred_xgb) / len(raw_pred_xgb)
-    oof_xgb_deep[val_idx] = rankdata(raw_pred_xgb_deep) / len(raw_pred_xgb_deep)
-
-    test_lgb += (rankdata(lgb_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
-    test_cat += (rankdata(cat_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
-    test_xgb += (rankdata(xgb_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
-    test_xgb_deep += (rankdata(xgb_deep_model.predict_proba(X_test_fold)[:, 1]) / len(X_test_fold)) / skf.n_splits
+    test_lgb_raw += lgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    test_cat_raw += cat_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    test_xgb_raw += xgb_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
+    test_xgb_deep_raw += xgb_deep_model.predict_proba(X_test_fold)[:, 1] / skf.n_splits
 
     print(f"--> FOLD {fold+1}/10 | LGBM: {roc_auc_score(y_val, oof_lgb[val_idx]):.5f} | CAT: {roc_auc_score(y_val, oof_cat[val_idx]):.5f} | XGB: {roc_auc_score(y_val, oof_xgb[val_idx]):.5f} | XGB_DEEP: {roc_auc_score(y_val, oof_xgb_deep[val_idx]):.5f}")
 
 # ============================================================
-# 5. RANK-BASED HYPERPLANE OPTIMIZATION (POWELL + SOFTMAX)
+# 5. GLOBAL RANK TRANSFORMATIONS (Executed Exactly Once)
 # ============================================================
 oof_lgb_rank = rankdata(oof_lgb) / len(oof_lgb)
 oof_cat_rank = rankdata(oof_cat) / len(oof_cat)
 oof_xgb_rank = rankdata(oof_xgb) / len(oof_xgb)
 oof_xgb_deep_rank = rankdata(oof_xgb_deep) / len(oof_xgb_deep)
 
-test_lgb_rank = rankdata(test_lgb) / len(test_lgb)
-test_cat_rank = rankdata(test_cat) / len(test_cat)
-test_xgb_rank = rankdata(test_xgb) / len(test_xgb)
-test_xgb_deep_rank = rankdata(test_xgb_deep) / len(test_xgb_deep)
+test_lgb_rank = rankdata(test_lgb_raw) / len(test_lgb_raw)
+test_cat_rank = rankdata(test_cat_raw) / len(test_cat_raw)
+test_xgb_rank = rankdata(test_xgb_raw) / len(test_xgb_raw)
+test_xgb_deep_rank = rankdata(test_xgb_deep_raw) / len(test_xgb_deep_raw)
 
 def auc_loss(weights_raw):
     exp_w = np.exp(weights_raw - np.max(weights_raw))
@@ -301,8 +298,8 @@ final_oof = w_lgb * oof_lgb_rank + w_cat * oof_cat_rank + w_xgb * oof_xgb_rank +
 final_score = roc_auc_score(y, final_oof)
 
 print('\n==================================================')
-print(f'OPTIMAL RANK WEIGHTS FOUND -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f} | XGB_DEEP: {w_xgb_deep:.4f}')
-print(f'NEW GLOBAL ROC AUC (10-Fold CV Rank Ensemble): {final_score:.5f}')
+print(f'OPTIMAL RANK WEIGHTS -> LGBM: {w_lgb:.4f} | CAT: {w_cat:.4f} | XGB: {w_xgb:.4f} | XGB_DEEP: {w_xgb_deep:.4f}')
+print(f'CORRECTED GLOBAL ROC AUC (10-Fold CV Rank Ensemble): {final_score:.5f}')
 print('==================================================')
 
 # ============================================================
@@ -317,4 +314,4 @@ submission = pd.DataFrame({
 
 OUTPUT_PATH = 'data/submission_advanced_ensemble.csv'
 submission.to_csv(OUTPUT_PATH, index=False)
-print(f'\nSuccess! High-performance submission saved to:\n{OUTPUT_PATH}')
+print(f'\nSuccess! Calibrated high-performance submission saved to:\n{OUTPUT_PATH}')
