@@ -1,5 +1,6 @@
-env/
+.vscode/
+catboost_info/
 data/
 *.csv
 __pycache__/
-catboost_info/
+env/
